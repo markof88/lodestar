@@ -120,14 +120,20 @@ func (r *DORAPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	policy.Status.ObservedNamespaces = namespaces
 
-	// ── 5. Garbage-collect stale workload entries ─────────────────────────
+	// ── 5. Observe deployments in selected namespaces ─────────────────────
+
+	if err := r.observeDeployments(ctx, policy, namespaces); err != nil {
+		log.Error(err, "observing deployments")
+	}
+
+	// ── 6. Garbage-collect stale workload entries ─────────────────────────
 
 	if err := r.gcWorkloads(ctx, policy, namespaces); err != nil {
 		// Non-fatal, log and continue. Will succeed on next reconcile.
 		log.Error(err, "garbage collecting workload status")
 	}
 
-	// ── 6. Mark Ready ────────────────────────────────────────────────────
+	// ── 7. Mark Ready ────────────────────────────────────────────────────
 
 	setCondition(&policy.Status.Conditions, metav1.Condition{
 		Type:               ConditionReady,
@@ -137,7 +143,7 @@ func (r *DORAPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		ObservedGeneration: policy.Generation,
 	})
 
-	// ── 7. Persist status ────────────────────────────────────────────────
+	// ── 8. Persist status ────────────────────────────────────────────────
 
 	if err := r.Status().Update(ctx, policy); err != nil {
 		log.Error(err, "updating status failed")
@@ -328,6 +334,141 @@ func (r *DORAPolicyReconciler) mapToDORAPolicy(ctx context.Context, obj client.O
 	}
 
 	return requests
+}
+
+// ============================================================================
+// Deployment observation
+// ============================================================================
+
+// observeDeployments iterates over all Deployments in the selected namespaces
+// and processes any that have completed a new rollout.
+func (r *DORAPolicyReconciler) observeDeployments(
+	ctx context.Context,
+	policy *lodestarv1alpha1.DORAPolicy,
+	namespaces []string,
+) error {
+	log := logf.FromContext(ctx)
+
+	for _, ns := range namespaces {
+		list := &appsv1.DeploymentList{}
+		if err := r.List(ctx, list, client.InNamespace(ns)); err != nil {
+			return fmt.Errorf("listing deployments in %s: %w", ns, err)
+		}
+
+		for i := range list.Items {
+			d := &list.Items[i]
+			if err := r.processDeployment(ctx, policy, d); err != nil {
+				// Non-fatal: log and continue to next deployment.
+				log.Error(err, "processing deployment",
+					"deployment", fmt.Sprintf("%s/%s", d.Namespace, d.Name))
+			}
+		}
+	}
+
+	return nil
+}
+
+// processDeployment checks a single Deployment for a completed rollout and
+// emits metrics if a new image digest is observed.
+func (r *DORAPolicyReconciler) processDeployment(
+	ctx context.Context,
+	policy *lodestarv1alpha1.DORAPolicy,
+	d *appsv1.Deployment,
+) error {
+	log := logf.FromContext(ctx)
+	key := fmt.Sprintf("%s/%s", d.Namespace, d.Name)
+
+	// ── 1. Check if rollout is complete ──────────────────────────────────
+
+	if !deploymentIsComplete(d) {
+		return nil
+	}
+
+	// ── 2. Load existing workload state ──────────────────────────────────
+
+	if policy.Status.Workloads == nil {
+		policy.Status.Workloads = make(map[string]lodestarv1alpha1.WorkloadStatus)
+	}
+	state := policy.Status.Workloads[key]
+
+	// ── 3. Check if this generation was already processed ────────────────
+	//
+	// This is the double-counting prevention. If we already processed this
+	// generation, skip it — even after operator restarts or informer resyncs.
+
+	if state.ObservedGeneration == d.Generation {
+		return nil
+	}
+
+	// ── 4. Extract image digest from running Pod ──────────────────────────
+
+	digest, inferred, err := imageDigestForDeployment(
+		ctx, r.Client, d, policy.Spec.PrimaryContainer,
+	)
+	if err != nil {
+		return fmt.Errorf("extracting image digest: %w", err)
+	}
+
+	// ── 5. Emit PrimaryContainerInferred condition if needed ──────────────
+
+	if inferred {
+		setCondition(&policy.Status.Conditions, metav1.Condition{
+			Type:               ConditionPrimaryContainerInferred,
+			Status:             metav1.ConditionTrue,
+			Reason:             "FallbackToIndex0",
+			Message:            fmt.Sprintf("workload %s has multiple containers; using index 0", key),
+			ObservedGeneration: policy.Generation,
+		})
+	}
+
+	// ── 6. Check if this is a genuinely new deployment ────────────────────
+	//
+	// Same digest as last time = config change only, not a new image.
+	// We still update ObservedGeneration to prevent reprocessing.
+
+	isNewDeployment := digest != state.LastDigest
+	isRollback := state.LastDigest != "" && isNewDeployment &&
+		digestSeenBefore(digest, policy.Status.Workloads)
+
+	// ── 7. Update workload state ──────────────────────────────────────────
+
+	now := metav1.Now()
+	state.LastDigest = digest
+	state.ObservedGeneration = d.Generation
+	state.LastCompletedAt = &now
+	state.RolloutStartedAt = nil // clear in-progress marker
+	policy.Status.Workloads[key] = state
+
+	// ── 8. Emit metrics ───────────────────────────────────────────────────
+
+	if isNewDeployment {
+		deploymentsTotal.WithLabelValues(
+			d.Namespace,
+			d.Name,
+			policy.Spec.Environment,
+		).Inc()
+
+		log.Info("deployment observed",
+			"workload", key,
+			"digest", digest,
+			"rollback", isRollback,
+			"environment", policy.Spec.Environment,
+		)
+	}
+
+	return nil
+}
+
+// digestSeenBefore returns true if the given digest matches the LastDigest
+// of any other workload tracked by this policy.
+// Used to detect rollbacks — a digest reverting to a previously seen value.
+func digestSeenBefore(digest string, workloads map[string]lodestarv1alpha1.WorkloadStatus) bool {
+	for _, w := range workloads {
+		if w.LastDigest == digest {
+			return true
+		}
+	}
+	return false
 }
 
 // ============================================================================
