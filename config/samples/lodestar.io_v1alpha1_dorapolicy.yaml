@@ -1,0 +1,9 @@
+apiVersion: lodestar.io.lodestar.io/v1alpha1
+kind: DORAPolicy
+metadata:
+  labels:
+    app.kubernetes.io/name: lodestar
+    app.kubernetes.io/managed-by: kustomize
+  name: dorapolicy-sample
+spec:
+  # TODO(user): Add fields here

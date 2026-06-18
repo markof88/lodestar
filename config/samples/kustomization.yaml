@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- lodestar.io_v1alpha1_dorapolicy.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
