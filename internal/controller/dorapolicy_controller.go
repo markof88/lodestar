@@ -18,16 +18,39 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	lodestariov1alpha1 "github.com/markof88/lodestar/api/v1alpha1"
+	lodestarv1alpha1 "github.com/markof88/lodestar/api/v1alpha1"
 )
 
-// DORAPolicyReconciler reconciles a DORAPolicy object
+// ============================================================================
+// Condition type constants
+// ============================================================================
+
+const (
+	ConditionReady                    = "Ready"
+	ConditionConflict                 = "Conflict"
+	ConditionPrimaryContainerInferred = "PrimaryContainerInferred"
+)
+
+// ============================================================================
+// Reconciler
+// ============================================================================
+
+// DORAPolicyReconciler reconciles DORAPolicy objects.
 type DORAPolicyReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -36,28 +59,293 @@ type DORAPolicyReconciler struct {
 // +kubebuilder:rbac:groups=lodestar.io,resources=dorapolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=lodestar.io,resources=dorapolicies/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=lodestar.io,resources=dorapolicies/finalizers,verbs=update
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the DORAPolicy object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
+// Reconcile is called by controller-runtime whenever a DORAPolicy or a watched secondary resource (Deployment, Namespace) changes.
 //
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.24.1/pkg/reconcile
+// It must be idempotent, calling it twice with the same state must produce the same result.
 func (r *DORAPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	log := logf.FromContext(ctx)
 
-	// TODO(user): your logic here
+	// ── 1. Fetch the DORAPolicy ───────────────────────────────────────────
 
+	policy := &lodestarv1alpha1.DORAPolicy{}
+	if err := r.Get(ctx, req.NamespacedName, policy); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Deleted between event being queued and us processing it.
+			// Nothing to do, owned resources are garbage-collected by Kubernetes.
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, fmt.Errorf("fetching DORAPolicy: %w", err)
+	}
+
+	log.Info("reconciling", "environment", policy.Spec.Environment)
+
+	// ── 2. Resolve selected namespaces ───────────────────────────────────
+
+	namespaces, err := r.resolveNamespaces(ctx, policy)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("resolving namespaces: %w", err)
+	}
+
+	// ── 3. Detect namespace conflicts ────────────────────────────────────
+
+	conflictReason, err := r.detectConflict(ctx, policy, namespaces)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("detecting conflicts: %w", err)
+	}
+
+	if conflictReason != "" {
+		setCondition(&policy.Status.Conditions, metav1.Condition{
+			Type:               ConditionConflict,
+			Status:             metav1.ConditionTrue,
+			Reason:             "NamespaceAlreadySelected",
+			Message:            conflictReason,
+			ObservedGeneration: policy.Generation,
+		})
+		if err := r.Status().Update(ctx, policy); err != nil {
+			log.Error(err, "updating conflict condition failed")
+			return ctrl.Result{}, fmt.Errorf("updating conflict condition: %w", err)
+		}
+		return ctrl.Result{}, nil
+	}
+
+	removeCondition(&policy.Status.Conditions, ConditionConflict)
+
+	// ── 4. Update observed namespaces ────────────────────────────────────
+
+	policy.Status.ObservedNamespaces = namespaces
+
+	// ── 5. Garbage-collect stale workload entries ─────────────────────────
+
+	if err := r.gcWorkloads(ctx, policy, namespaces); err != nil {
+		// Non-fatal, log and continue. Will succeed on next reconcile.
+		log.Error(err, "garbage collecting workload status")
+	}
+
+	// ── 6. Mark Ready ────────────────────────────────────────────────────
+
+	setCondition(&policy.Status.Conditions, metav1.Condition{
+		Type:               ConditionReady,
+		Status:             metav1.ConditionTrue,
+		Reason:             "Reconciled",
+		Message:            fmt.Sprintf("observing %d namespace(s)", len(namespaces)),
+		ObservedGeneration: policy.Generation,
+	})
+
+	// ── 7. Persist status ────────────────────────────────────────────────
+
+	if err := r.Status().Update(ctx, policy); err != nil {
+		log.Error(err, "updating status failed")
+		return ctrl.Result{}, fmt.Errorf("updating status: %w", err)
+	}
+
+	log.Info("reconciled", "namespaces", namespaces)
 	return ctrl.Result{}, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
+// ============================================================================
+// Namespace resolution
+// ============================================================================
+
+// resolveNamespaces returns the names of namespaces this policy observes.
+// When NamespaceSelector is nil, returns only the policy's own namespace.
+func (r *DORAPolicyReconciler) resolveNamespaces(
+	ctx context.Context,
+	policy *lodestarv1alpha1.DORAPolicy,
+) ([]string, error) {
+	if policy.Spec.NamespaceSelector == nil {
+		return []string{policy.Namespace}, nil
+	}
+
+	selector, err := metav1.LabelSelectorAsSelector(policy.Spec.NamespaceSelector)
+	if err != nil {
+		return nil, fmt.Errorf("parsing namespace selector: %w", err)
+	}
+
+	nsList := &corev1.NamespaceList{}
+	if err := r.List(ctx, nsList, &client.ListOptions{LabelSelector: selector}); err != nil {
+		return nil, fmt.Errorf("listing namespaces: %w", err)
+	}
+
+	names := make([]string, 0, len(nsList.Items))
+	for _, ns := range nsList.Items {
+		names = append(names, ns.Name)
+	}
+	return names, nil
+}
+
+// ============================================================================
+// Conflict detection
+// ============================================================================
+
+// detectConflict returns a non-empty reason string if any namespace in the given list is already claimed by an older DORAPolicy.
+func (r *DORAPolicyReconciler) detectConflict(
+	ctx context.Context,
+	policy *lodestarv1alpha1.DORAPolicy,
+	namespaces []string,
+) (string, error) {
+	allPolicies := &lodestarv1alpha1.DORAPolicyList{}
+	if err := r.List(ctx, allPolicies); err != nil {
+		return "", fmt.Errorf("listing policies: %w", err)
+	}
+
+	ours := make(map[string]struct{}, len(namespaces))
+	for _, ns := range namespaces {
+		ours[ns] = struct{}{}
+	}
+
+	for i := range allPolicies.Items {
+		other := &allPolicies.Items[i]
+
+		// Skip ourselves.
+		if other.UID == policy.UID {
+			continue
+		}
+
+		// Determine priority: older timestamp wins.
+		// When timestamps are equal (same second), smaller UID wins —
+		// UIDs are UUIDs assigned at creation time so this is stable.
+		otherIsOlder := other.CreationTimestamp.Before(&policy.CreationTimestamp) ||
+			(other.CreationTimestamp.Equal(&policy.CreationTimestamp) &&
+				string(other.UID) < string(policy.UID))
+
+		if !otherIsOlder {
+			continue
+		}
+
+		otherNS, err := r.resolveNamespaces(ctx, other)
+		if err != nil {
+			continue
+		}
+
+		for _, ns := range otherNS {
+			if _, overlap := ours[ns]; overlap {
+				return fmt.Sprintf(
+					"namespace %q already selected by DORAPolicy %s/%s",
+					ns, other.Namespace, other.Name,
+				), nil
+			}
+		}
+	}
+
+	return "", nil
+}
+
+// ============================================================================
+// Garbage collection
+// ============================================================================
+
+// gcWorkloads removes status.workloads entries for Deployments that no longer exist in the observed namespaces.
+func (r *DORAPolicyReconciler) gcWorkloads(
+	ctx context.Context,
+	policy *lodestarv1alpha1.DORAPolicy,
+	namespaces []string,
+) error {
+	if len(policy.Status.Workloads) == 0 {
+		return nil
+	}
+
+	existing := make(map[string]struct{})
+	for _, ns := range namespaces {
+		list := &appsv1.DeploymentList{}
+		if err := r.List(ctx, list, client.InNamespace(ns)); err != nil {
+			return fmt.Errorf("listing deployments in %s: %w", ns, err)
+		}
+		for _, d := range list.Items {
+			existing[fmt.Sprintf("%s/%s", d.Namespace, d.Name)] = struct{}{}
+		}
+	}
+
+	for key := range policy.Status.Workloads {
+		if _, found := existing[key]; !found {
+			delete(policy.Status.Workloads, key)
+		}
+	}
+
+	return nil
+}
+
+// ============================================================================
+// Condition helpers
+// ============================================================================
+
+// setCondition upserts a condition into the conditions slice.
+// Uses the standard apimachinery helper which handles LastTransitionTime correctly, it only updates the timestamp when the Status actually changes.
+func setCondition(conditions *[]metav1.Condition, cond metav1.Condition) {
+	meta.SetStatusCondition(conditions, cond)
+}
+
+// removeCondition removes a condition by type.
+func removeCondition(conditions *[]metav1.Condition, condType string) {
+	meta.RemoveStatusCondition(conditions, condType)
+}
+
+// ============================================================================
+// Watch mapping, secondary resources to DORAPolicy
+// ============================================================================
+
+// mapToDORAPolicy is an event handler that maps a secondary object (Deployment, Namespace) to the DORAPolicy reconcile requests that should be triggered.
+//
+// Strategy: list all DORAPolicy objects and enqueue any whose observed namespaces include the changed object's namespace.
+func (r *DORAPolicyReconciler) mapToDORAPolicy(ctx context.Context, obj client.Object) []reconcile.Request {
+	policies := &lodestarv1alpha1.DORAPolicyList{}
+	if err := r.List(ctx, policies); err != nil {
+		return nil
+	}
+
+	ns := obj.GetNamespace()
+	var requests []reconcile.Request
+
+	for _, policy := range policies.Items {
+		if policy.Spec.NamespaceSelector == nil {
+			if policy.Namespace == ns {
+				requests = append(requests, reconcile.Request{
+					NamespacedName: types.NamespacedName{
+						Namespace: policy.Namespace,
+						Name:      policy.Name,
+					},
+				})
+			}
+			continue
+		}
+
+		for _, observed := range policy.Status.ObservedNamespaces {
+			if observed == ns {
+				requests = append(requests, reconcile.Request{
+					NamespacedName: types.NamespacedName{
+						Namespace: policy.Namespace,
+						Name:      policy.Name,
+					},
+				})
+				break
+			}
+		}
+	}
+
+	return requests
+}
+
+// ============================================================================
+// SetupWithManager
+// ============================================================================
+
+// SetupWithManager registers the controller with the manager and declares which objects it watches.
 func (r *DORAPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&lodestariov1alpha1.DORAPolicy{}).
+		For(&lodestarv1alpha1.DORAPolicy{}).
+		Watches(
+			&appsv1.Deployment{},
+			handler.EnqueueRequestsFromMapFunc(r.mapToDORAPolicy),
+		).
+		Watches(
+			&corev1.Namespace{},
+			handler.EnqueueRequestsFromMapFunc(r.mapToDORAPolicy),
+		).
 		Named("dorapolicy").
 		Complete(r)
 }
