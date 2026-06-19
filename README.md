@@ -1,135 +1,117 @@
-# lodestar
-// TODO(user): Add simple overview of use/purpose
+# Lodestar
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+A Kubernetes operator that computes DORA metrics from runtime state.
 
-## Getting Started
+Most DORA metric tools work by reading your CI/CD pipeline events: what GitHub Actions reported, what Jenkins logged, what ArgoCD says it deployed. Lodestar takes a different approach. It watches your cluster directly and measures what actually ran in production, not what a pipeline claimed happened.
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+You install one operator, create one `DORAPolicy` resource, and Lodestar starts computing Deployment Frequency, Lead Time for Changes, Change Failure Rate, and MTTR for every workload in the namespaces you point it at. Your application teams never have to add an annotation, install an agent, or change anything about how they deploy.
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+## Why runtime state
 
-```sh
-make docker-build docker-push IMG=<some-registry>/lodestar:tag
+A Deployment's `spec.template.spec.containers[].image` field tells you what someone *wanted* to run. It's often a mutable tag like `myapp:latest`, which can point to a different image entirely from one day to the next. It's not proof anything actually happened.
+
+The Pod that's actually running has a `status.containerStatuses[].imageID` field. This is always a fully resolved digest, something like `sha256:a1b2c3...`. It's set by the kubelet after the image was pulled and the container started. That's the closest thing to ground truth you can get from inside a cluster, and it's what Lodestar reads.
+
+## How it works
+
+```yaml
+apiVersion: lodestar.io/v1alpha1
+kind: DORAPolicy
+metadata:
+  name: production
+  namespace: lodestar-system
+spec:
+  environment: production
+  namespaceSelector:
+    matchLabels:
+      environment: production
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+Apply that, and Lodestar starts watching every namespace labeled `environment: production`. For each Deployment it finds, it:
 
-**Install the CRDs into the cluster:**
+1. Waits for a rollout to fully complete (all replicas updated, available, and passing readiness)
+2. Reads the real image digest from the running Pod, not the tag in the spec
+3. Compares it against the last digest it saw for that workload
+4. If it's new, counts a deployment and tries to work out how long the image sat around before it got here
 
-```sh
-make install
+For that last part it reads the `org.opencontainers.image.created` label baked into the image at build time. Most CI systems set this automatically (GitHub Actions, GitLab CI, and anything using Buildpacks all do it without extra configuration). Lodestar subtracts that timestamp from the deployment time and that's your Lead Time. If the label isn't there, Lodestar doesn't guess, it just skips the metric for that deployment rather than making something up.
+
+Failures are tracked too. Within a configurable window after a deployment (15 minutes by default), Lodestar watches for `CrashLoopBackOff`, `OOMKilled`, a Deployment hitting `ProgressDeadlineExceeded`, or a rollback to a previously seen digest. Any of those opens an incident. The next successful deployment closes it, and the time between is your MTTR.
+
+Everything comes out as Prometheus metrics on the operator's `/metrics` endpoint. There's no separate dashboard to stand up. If you already have Grafana scraping your cluster, point it at Lodestar and build panels with the metrics already there.
+
+## Metrics
+
+| Metric | Type | What it tells you |
+|---|---|---|
+| `lodestar_deployments_total` | counter | Deployment Frequency, as a rate over time |
+| `lodestar_lead_time_seconds` | histogram | Time from image build to running in production |
+| `lodestar_failed_deployments_total` | counter | Numerator for Change Failure Rate |
+| `lodestar_time_to_restore_seconds` | histogram | MTTR |
+
+All four carry `namespace`, `workload`, and `environment` labels so you can slice by team or service.
+
+## Installing
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/markof88/lodestar/main/config/crd/bases/lodestar.io_dorapolicies.yaml
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+Then deploy the operator (see `config/manager` for the manifest, or use the Helm chart once it lands).
 
-```sh
-make deploy IMG=<some-registry>/lodestar:tag
+Create a `DORAPolicy` in the namespace where the operator runs, pointing at whichever namespaces you want observed. That's the entire setup.
+
+## Registry authentication
+
+When Lodestar needs to read OCI labels off an image, it reuses whatever credentials the kubelet already had for pulling that image: the Pod's `imagePullSecrets`, the ServiceAccount's pull secrets, or cloud workload identity (IRSA on EKS, Workload Identity on GKE, similar on AKS) if nothing else applies. There's no separate credential to provision for Lodestar itself.
+
+If you ever suspect the cached image metadata has gone stale, you can force a refresh:
+
+```bash
+kubectl annotate dorapolicy production lodestar.io/refresh-image-cache=true
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+Lodestar clears its cache on the next reconcile and removes the annotation automatically.
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+## Configuration reference
 
-```sh
-kubectl apply -k config/samples/
+```yaml
+spec:
+  environment: production        # production | staging | development
+
+  namespaceSelector:              # omit to watch only the policy's own namespace
+    matchLabels:
+      environment: production
+
+  primaryContainer: ""            # name of the container whose digest matters
+                                   # for multi-container pods. leave blank and
+                                   # Lodestar will pick the only non-sidecar
+                                   # container if there's exactly one, otherwise
+                                   # it falls back to index 0 and tells you about
+                                   # it via a condition
+
+  failureWindow: 15m               # how long after a deploy to watch for trouble
+
+  failureSignals:
+    builtIn:                       # omit this whole block to enable all four
+      - ProgressDeadlineExceeded
+      - CrashLoopBackOff
+      - OOMKilled
+      - Rollback
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+## What Lodestar deliberately doesn't do
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+It doesn't read your Git history or your CI logs. If your build pipeline takes two days from commit to image, that shows up in Lead Time, and that's accurate, that's actually how long it took. A future version may support a webhook from your Git provider for teams that want commit-to-production precision instead of build-to-production, but that's additive, not a replacement for what's here now.
 
-```sh
-kubectl delete -k config/samples/
-```
+It doesn't require ArgoCD, Flux, or any particular GitOps tool. It watches Deployments directly, so it works the same whether you deploy with `kubectl apply`, Helm, or a GitOps controller.
 
-**Delete the APIs(CRDs) from the cluster:**
+It doesn't ship a UI. Prometheus and whatever you already use to look at Prometheus data is the UI.
 
-```sh
-make uninstall
-```
+## Status
 
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/lodestar:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/lodestar/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+Early. The core metric pipeline works and is tested, but this hasn't run in a real production cluster yet. Treat it accordingly. StatefulSet and DaemonSet support, plus the optional Git webhook for exact Lead Time, are not built yet.
 
 ## License
 
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Apache 2.0
