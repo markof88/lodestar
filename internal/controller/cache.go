@@ -72,8 +72,18 @@ func (c *digestCache) set(digest string, meta imageMetadata) {
 }
 
 // invalidate removes a cached entry, forcing the next lookup to re-fetch
-// from the registry. Used by the gauge.io/refresh-image-cache annotation
-// for operational debugging.
+// from the registry.
 func (c *digestCache) invalidate(digest string) {
 	c.entries.Delete(digest)
+}
+
+// invalidateAll clears every cached entry. Used by the
+// lodestar.io/refresh-image-cache annotation for operational debugging —
+// when someone suspects stale OCI label data, this forces a full re-fetch
+// on the next observation cycle.
+func (c *digestCache) invalidateAll() {
+	c.entries.Range(func(key, _ any) bool {
+		c.entries.Delete(key)
+		return true
+	})
 }

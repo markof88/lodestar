@@ -109,6 +109,12 @@ func (r *DORAPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	log.Info("reconciling", "environment", policy.Spec.Environment)
 
+	// ── 1b. Handle cache refresh annotation ────────────────────────────────
+
+	if err := r.handleCacheRefreshAnnotation(ctx, policy); err != nil {
+		log.Error(err, "handling cache refresh annotation")
+	}
+
 	// ── 2. Resolve selected namespaces ───────────────────────────────────
 
 	namespaces, err := r.resolveNamespaces(ctx, policy)
@@ -176,6 +182,32 @@ func (r *DORAPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	log.Info("reconciled", "namespaces", namespaces)
 	return ctrl.Result{}, nil
+}
+
+const annotationRefreshImageCache = "lodestar.io/refresh-image-cache"
+
+// handleCacheRefreshAnnotation clears the image metadata cache when the
+// lodestar.io/refresh-image-cache annotation is present, then removes the
+// annotation so it does not trigger on every subsequent reconcile.
+func (r *DORAPolicyReconciler) handleCacheRefreshAnnotation(
+	ctx context.Context,
+	policy *lodestarv1alpha1.DORAPolicy,
+) error {
+	if policy.Annotations[annotationRefreshImageCache] != "true" {
+		return nil
+	}
+
+	log := logf.FromContext(ctx)
+	log.Info("refreshing image metadata cache", "policy", policy.Name)
+
+	r.getRegistryClient().cache.invalidateAll()
+
+	delete(policy.Annotations, annotationRefreshImageCache)
+	if err := r.Update(ctx, policy); err != nil {
+		return fmt.Errorf("removing refresh annotation: %w", err)
+	}
+
+	return nil
 }
 
 // ============================================================================
