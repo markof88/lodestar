@@ -156,6 +156,12 @@ func (r *DORAPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		log.Error(err, "observing deployments")
 	}
 
+	// ── 5b. Check for failure signals within the failure window ────────────
+
+	if err := r.checkFailureSignals(ctx, policy, namespaces); err != nil {
+		log.Error(err, "checking failure signals")
+	}
+
 	// ── 6. Garbage-collect stale workload entries ─────────────────────────
 
 	if err := r.gcWorkloads(ctx, policy, namespaces); err != nil {
@@ -517,9 +523,136 @@ func (r *DORAPolicyReconciler) processDeployment(
 		if !isRollback {
 			r.observeLeadTime(ctx, policy, d, digest)
 		}
+
+		if isRollback && enabledSignals(policy)[lodestarv1alpha1.SignalRollback] {
+			r.recordFailure(policy, key, detectedFailure{
+				Signal:  lodestarv1alpha1.SignalRollback,
+				Reason:  "Rollback",
+				Message: fmt.Sprintf("workload %s rolled back to a previously seen image digest", key),
+			})
+		} else {
+			// A genuinely new forward deployment recovers any open incident.
+			r.recordRecovery(policy, key)
+		}
 	}
 
 	return nil
+}
+
+// checkFailureSignals scans all observed Deployments for CrashLoopBackOff,
+// OOMKilled, and ProgressDeadlineExceeded signals, but only within the
+// configured failure window following the workload's last completed rollout.
+//
+// This runs on every reconcile — independent of whether a new rollout was
+// just observed — because failures often surface minutes after a deploy
+// completes (e.g. a slow memory leak triggering OOMKilled).
+func (r *DORAPolicyReconciler) checkFailureSignals(
+	ctx context.Context,
+	policy *lodestarv1alpha1.DORAPolicy,
+	namespaces []string,
+) error {
+	if len(policy.Status.Workloads) == 0 {
+		return nil
+	}
+
+	enabled := enabledSignals(policy)
+	window := failureWindowDuration(policy)
+
+	for _, ns := range namespaces {
+		list := &appsv1.DeploymentList{}
+		if err := r.List(ctx, list, client.InNamespace(ns)); err != nil {
+			return fmt.Errorf("listing deployments in %s: %w", ns, err)
+		}
+
+		for i := range list.Items {
+			d := &list.Items[i]
+			key := fmt.Sprintf("%s/%s", d.Namespace, d.Name)
+
+			state, tracked := policy.Status.Workloads[key]
+			if !tracked || state.LastCompletedAt == nil {
+				// No completed rollout recorded yet — nothing to evaluate against.
+				continue
+			}
+
+			// Outside the failure window: this workload's last deployment is
+			// old enough that new failures are not attributed to it.
+			if time.Since(state.LastCompletedAt.Time) > window {
+				continue
+			}
+
+			failures, err := detectFailures(ctx, r.Client, d, enabled)
+			if err != nil {
+				logf.FromContext(ctx).Error(err, "detecting failures", "workload", key)
+				continue
+			}
+
+			for _, f := range failures {
+				r.recordFailure(policy, key, f)
+			}
+		}
+	}
+
+	return nil
+}
+
+// recordFailure marks a workload as having an active failure incident,
+// emitting lodestar_failed_deployments_total exactly once per incident.
+//
+// Idempotent: if FailureDetectedAt is already set, this is a no-op — the
+// incident is already being tracked and must not be double-counted.
+func (r *DORAPolicyReconciler) recordFailure(
+	policy *lodestarv1alpha1.DORAPolicy,
+	key string,
+	f detectedFailure,
+) {
+	state := policy.Status.Workloads[key]
+	if state.FailureDetectedAt != nil {
+		// Incident already open — do not reset the clock or double-count.
+		return
+	}
+
+	now := metav1.Now()
+	state.FailureDetectedAt = &now
+	policy.Status.Workloads[key] = state
+
+	parts := strings.SplitN(key, "/", 2)
+	namespace, workload := parts[0], parts[1]
+
+	failedDeploymentsTotal.WithLabelValues(
+		namespace,
+		workload,
+		policy.Spec.Environment,
+		string(f.Signal),
+	).Inc()
+}
+
+// recordRecovery closes an open failure incident when a new successful
+// rollout completes, emitting lodestar_time_to_restore_seconds (MTTR).
+//
+// Idempotent: if no incident is open (FailureDetectedAt is nil), this is a
+// no-op.
+func (r *DORAPolicyReconciler) recordRecovery(policy *lodestarv1alpha1.DORAPolicy, key string) {
+	state := policy.Status.Workloads[key]
+	if state.FailureDetectedAt == nil {
+		return
+	}
+
+	mttr := time.Since(state.FailureDetectedAt.Time)
+	state.FailureDetectedAt = nil
+	policy.Status.Workloads[key] = state
+
+	if mttr < 0 {
+		return
+	}
+
+	parts := strings.SplitN(key, "/", 2)
+	namespace, workload := parts[0], parts[1]
+
+	timeToRestoreSeconds.WithLabelValues(
+		namespace,
+		workload,
+		policy.Spec.Environment,
+	).Observe(mttr.Seconds())
 }
 
 // observeLeadTime computes and emits Lead Time for Changes: the duration
