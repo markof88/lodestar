@@ -84,6 +84,7 @@ type DORAPolicyReconciler struct {
 // +kubebuilder:rbac:groups=lodestar.io,resources=dorapolicies/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=lodestar.io,resources=dorapolicies/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch
