@@ -166,4 +166,63 @@ var _ = Describe("Rollout detection", func() {
 			Expect(extractDigest("")).To(Equal(""))
 		})
 	})
+	// ── imageRepository ───────────────────────────────────────────────────
+
+	Describe("imageRepository", func() {
+		It("strips a digest suffix", func() {
+			pod := corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "app", Image: "ghcr.io/markof88/myapp@sha256:abc123"},
+					},
+				},
+			}
+			Expect(imageRepository(&pod, "")).To(Equal("ghcr.io/markof88/myapp"))
+		})
+
+		It("strips a tag suffix", func() {
+			pod := corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "app", Image: "ghcr.io/markof88/myapp:v1.2.3"},
+					},
+				},
+			}
+			Expect(imageRepository(&pod, "")).To(Equal("ghcr.io/markof88/myapp"))
+		})
+
+		It("handles a registry with a port number correctly", func() {
+			pod := corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "app", Image: "localhost:5000/myapp:v1"},
+					},
+				},
+			}
+			Expect(imageRepository(&pod, "")).To(Equal("localhost:5000/myapp"))
+		})
+
+		It("returns the image unchanged when no tag or digest present", func() {
+			pod := corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "app", Image: "ghcr.io/markof88/myapp"},
+					},
+				},
+			}
+			Expect(imageRepository(&pod, "")).To(Equal("ghcr.io/markof88/myapp"))
+		})
+
+		It("uses the named primary container", func() {
+			pod := corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "istio-proxy", Image: "istio/proxy:1.20"},
+						{Name: "app", Image: "ghcr.io/markof88/myapp:v1"},
+					},
+				},
+			}
+			Expect(imageRepository(&pod, "app")).To(Equal("ghcr.io/markof88/myapp"))
+		})
+	})
 })

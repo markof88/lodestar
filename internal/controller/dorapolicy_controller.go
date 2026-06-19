@@ -19,6 +19,11 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"k8s.io/client-go/kubernetes"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -46,6 +51,16 @@ const (
 	ConditionPrimaryContainerInferred = "PrimaryContainerInferred"
 )
 
+// registryClient returns the shared registryClient instance, constructing
+// it on first use. Lazy construction avoids requiring Clientset to be set
+// in tests that don't exercise Lead Time calculation.
+func (r *DORAPolicyReconciler) getRegistryClient() *registryClient {
+	r.registryOnce.Do(func() {
+		r.registry = newRegistryClient(r.Clientset, newDigestCache())
+	})
+	return r.registry
+}
+
 // ============================================================================
 // Reconciler
 // ============================================================================
@@ -54,6 +69,15 @@ const (
 type DORAPolicyReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// Clientset is the classic Kubernetes client, used by k8schain to
+	// resolve imagePullSecrets and ServiceAccount credentials when reading
+	// OCI image metadata from container registries.
+	Clientset kubernetes.Interface
+
+	// registry lazily constructed on first use — see registryClient().
+	registry     *registryClient
+	registryOnce sync.Once
 }
 
 // +kubebuilder:rbac:groups=lodestar.io,resources=dorapolicies,verbs=get;list;watch;create;update;patch;delete
@@ -454,9 +478,74 @@ func (r *DORAPolicyReconciler) processDeployment(
 			"rollback", isRollback,
 			"environment", policy.Spec.Environment,
 		)
+
+		// Lead Time is only meaningful for forward deployments, not rollbacks —
+		// a rollback's "build time" is in the past and would produce a
+		// misleadingly large or even negative duration.
+		if !isRollback {
+			r.observeLeadTime(ctx, policy, d, digest)
+		}
 	}
 
 	return nil
+}
+
+// observeLeadTime computes and emits Lead Time for Changes: the duration
+// from image build time to production deployment.
+//
+// Failures here are non-fatal and logged only — Deployment Frequency must
+// never be blocked by registry connectivity issues.
+func (r *DORAPolicyReconciler) observeLeadTime(
+	ctx context.Context,
+	policy *lodestarv1alpha1.DORAPolicy,
+	d *appsv1.Deployment,
+	digest string,
+) {
+	log := logf.FromContext(ctx)
+
+	pod, err := runningPodForDeployment(ctx, r.Client, d)
+	if err != nil {
+		log.Error(err, "finding pod for lead time calculation")
+		return
+	}
+
+	repository := imageRepository(pod, policy.Spec.PrimaryContainer)
+	if repository == "" {
+		log.Info("could not determine image repository, skipping lead time")
+		return
+	}
+
+	meta, err := r.getRegistryClient().GetMetadata(ctx, imageRef{
+		Repository:         repository,
+		Digest:             digest,
+		Namespace:          pod.Namespace,
+		ServiceAccountName: pod.Spec.ServiceAccountName,
+		ImagePullSecrets:   podPullSecretNames(pod.Spec),
+	})
+	if err != nil {
+		log.Error(err, "fetching image metadata for lead time")
+		return
+	}
+
+	if meta.CreatedAt == nil {
+		log.Info("image has no org.opencontainers.image.created label, skipping lead time",
+			"digest", digest)
+		return
+	}
+
+	leadTime := time.Since(*meta.CreatedAt)
+	if leadTime < 0 {
+		// Clock skew between build and cluster — do not emit a negative duration.
+		log.Info("computed negative lead time, skipping", "digest", digest)
+		return
+	}
+
+	leadTimeSeconds.WithLabelValues(
+		d.Namespace,
+		d.Name,
+		policy.Spec.Environment,
+		"image_label",
+	).Observe(leadTime.Seconds())
 }
 
 // digestSeenBefore returns true if the given digest matches the LastDigest
@@ -469,6 +558,28 @@ func digestSeenBefore(digest string, workloads map[string]lodestarv1alpha1.Workl
 		}
 	}
 	return false
+}
+
+// imageRepository returns the image repository (without tag or digest) for
+// the primary container of the given Pod.
+func imageRepository(pod *corev1.Pod, primaryContainerName string) string {
+	idx, _ := resolvePrimaryContainer(pod.Spec, primaryContainerName)
+	if idx >= len(pod.Spec.Containers) {
+		return ""
+	}
+
+	image := pod.Spec.Containers[idx].Image
+	// Strip tag or digest suffix to get the bare repository reference.
+	if at := strings.LastIndex(image, "@"); at != -1 {
+		return image[:at]
+	}
+	if colon := strings.LastIndex(image, ":"); colon != -1 {
+		// Guard against ports in registry hostnames, e.g. localhost:5000/app
+		if slash := strings.LastIndex(image, "/"); slash == -1 || colon > slash {
+			return image[:colon]
+		}
+	}
+	return image
 }
 
 // ============================================================================
@@ -489,4 +600,43 @@ func (r *DORAPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		).
 		Named("dorapolicy").
 		Complete(r)
+}
+
+// runningPodForDeployment finds a running Pod owned by the Deployment's
+// current ReplicaSet. Used by Lead Time calculation to read the Pod's
+// imagePullSecrets and ServiceAccountName for registry authentication.
+func runningPodForDeployment(
+	ctx context.Context,
+	c client.Client,
+	d *appsv1.Deployment,
+) (*corev1.Pod, error) {
+	rsList := &appsv1.ReplicaSetList{}
+	if err := c.List(ctx, rsList,
+		client.InNamespace(d.Namespace),
+		client.MatchingLabels(d.Spec.Selector.MatchLabels),
+	); err != nil {
+		return nil, fmt.Errorf("listing replicasets: %w", err)
+	}
+
+	currentRS := currentReplicaSet(d, rsList.Items)
+	if currentRS == nil {
+		return nil, fmt.Errorf("no current replicaset found for deployment %s/%s",
+			d.Namespace, d.Name)
+	}
+
+	podList := &corev1.PodList{}
+	if err := c.List(ctx, podList,
+		client.InNamespace(d.Namespace),
+		client.MatchingLabels(currentRS.Spec.Selector.MatchLabels),
+	); err != nil {
+		return nil, fmt.Errorf("listing pods: %w", err)
+	}
+
+	pod := runningPod(podList.Items)
+	if pod == nil {
+		return nil, fmt.Errorf("no running pod found for replicaset %s/%s",
+			currentRS.Namespace, currentRS.Name)
+	}
+
+	return pod, nil
 }
